@@ -22,6 +22,7 @@ import (
 	"github.com/towns-protocol/towns/core/node/base"
 	"github.com/towns-protocol/towns/core/node/crypto"
 	"github.com/towns-protocol/towns/core/node/events"
+	"github.com/towns-protocol/towns/core/node/infra"
 	"github.com/towns-protocol/towns/core/node/logging"
 	"github.com/towns-protocol/towns/core/node/nodes"
 	"github.com/towns-protocol/towns/core/node/notifications/debug_streams"
@@ -402,8 +403,12 @@ func (ssr *syncSessionRunner) Run() {
 	ssr.syncer = syncer
 	go ssr.syncer.Run()
 
+	// Track open sync sessions per node
+	ssr.metrics.OpenSyncSessions.With(prometheus.Labels{"node": ssr.node.Hex()}).Inc()
+	defer ssr.metrics.OpenSyncSessions.With(prometheus.Labels{"node": ssr.node.Hex()}).Dec()
+
 	// Track active syncs spawned by the multi sync runner.
-	// There will be a bit of dlay between when the sync is cancelled and it is decremented, but on average these
+	// There will be a bit of delay between when the sync is cancelled and it is decremented, but on average these
 	// should be fairly accurate.
 	ssr.metrics.ActiveStreamSyncSessions.Inc()
 	defer ssr.metrics.ActiveStreamSyncSessions.Dec()
@@ -634,7 +639,7 @@ func (msr *MultiSyncRunner) getNodeRequestPool(addr common.Address) *semaphore.W
 
 // NewMultiSyncRunner creates a MultiSyncRunner instance.
 func NewMultiSyncRunner(
-	metrics *TrackStreamsSyncMetrics,
+	metricsFactory infra.MetricsFactory,
 	onChainConfig crypto.OnChainConfiguration,
 	nodeRegistries []nodes.NodeRegistry,
 	trackedStreamViewConstructor TrackedViewConstructorFn,
@@ -653,7 +658,7 @@ func NewMultiSyncRunner(
 	}
 
 	return &MultiSyncRunner{
-		metrics:                metrics,
+		metrics:                NewTrackStreamsSyncMetrics(metricsFactory),
 		onChainConfig:          onChainConfig,
 		nodeRegistries:         nodeRegistries,
 		trackedViewConstructor: trackedStreamViewConstructor,
@@ -670,6 +675,21 @@ func NewMultiSyncRunner(
 func (msr *MultiSyncRunner) Run(
 	rootCtx context.Context,
 ) {
+	// Start metrics reporter for unsynced queue length
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-ticker.C:
+				msr.metrics.UnsyncedQueueLength.Set(float64(len(msr.streamsToSync)))
+			}
+		}
+	}()
+
 consume_loop:
 	for {
 		select {
